@@ -282,8 +282,16 @@ def main():
             if "error" in res:
                 st.error(f"❌ ERROR for {ticker}: {res['error']}")
             else:
-                color = "#28a745" if res['Status'] == "RECOMMENDED" else "#ffc107" if res['Status'] == "CONSIDER" else "#dc3545"
-                st.markdown(f"<h2 style='color:{color}; border:1px solid {color}; padding:10px'>{res['Status']}</h2>", unsafe_allow_html=True)
+                if res['Status'] == "RECOMMENDED":
+                    bg_color = "#d4edda"
+                    text_color = "#155724"
+                elif res['Status'] == "CONSIDER":
+                    bg_color = "#fff3cd"
+                    text_color = "#856404"
+                else:
+                    bg_color = "#f8d7da"
+                    text_color = "#721c24"
+                st.markdown(f"<h2 style='background-color:{bg_color}; color:{text_color}; border:2px solid {text_color}; padding:12px; border-radius:6px; text-align:center; font-weight:bold'>{res['Status']}</h2>", unsafe_allow_html=True)
                 
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Next Earnings", res['Next Earnings'])
@@ -392,9 +400,12 @@ def main():
                     
                     def color_row(row):
                         s = row['Status']
-                        if s == 'RECOMMENDED': return ['background-color: #d4edda']*len(row)
-                        if s == 'ERROR': return ['background-color: #f8d7da']*len(row)
-                        if s == 'CONSIDER': return ['background-color: #fff3cd']*len(row)
+                        if s == 'RECOMMENDED': 
+                            return ['background-color: #d4edda; color: #155724; font-weight: bold']*len(row)
+                        if s == 'ERROR': 
+                            return ['background-color: #f8d7da; color: #721c24; font-weight: bold']*len(row)
+                        if s == 'CONSIDER': 
+                            return ['background-color: #fff3cd; color: #856404; font-weight: bold']*len(row)
                         return ['']*len(row)
 
                     try:
