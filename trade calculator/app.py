@@ -5,7 +5,6 @@ from scipy.interpolate import interp1d
 import numpy as np
 import pandas as pd
 import time
-import requests
 import random
 
 # ==========================================
@@ -22,17 +21,6 @@ def get_headers():
     ]
     return {'User-Agent': random.choice(user_agents)}
 
-@st.cache_data(ttl=86400) # Cache S&P list for 24 hours
-def get_sp500_tickers():
-    """Scrapes the S&P 500 list from Wikipedia."""
-    try:
-        url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-        tables = pd.read_html(url)
-        df = tables[0]
-        return df['Symbol'].tolist()
-    except Exception as e:
-        return []
-
 def filter_dates(dates):
     today = datetime.today().date()
     cutoff_date = today + timedelta(days=45)
@@ -42,7 +30,7 @@ def filter_dates(dates):
         try:
             dt_objs.append(datetime.strptime(d, "%Y-%m-%d").date())
         except:
-            continue # Skip weird formats
+            continue 
             
     sorted_dates = sorted(dt_objs)
 
@@ -62,7 +50,7 @@ def filter_dates(dates):
 
 def yang_zhang(price_data, window=30, trading_periods=252, return_last_only=True):
     if len(price_data) < window:
-        return 0 # Not enough data
+        return 0 
         
     log_ho = (price_data['High'] / price_data['Open']).apply(np.log)
     log_lo = (price_data['Low'] / price_data['Open']).apply(np.log)
@@ -91,7 +79,6 @@ def build_term_structure(days, ivs):
     days = np.array(days)
     ivs = np.array(ivs)
     
-    # Remove duplicates or NaNs
     valid_mask = ~np.isnan(days) & ~np.isnan(ivs)
     days = days[valid_mask]
     ivs = ivs[valid_mask]
@@ -112,30 +99,25 @@ def build_term_structure(days, ivs):
     return term_spline
 
 # ==========================================
-# CORE LOGIC (Robust)
+# CORE LOGIC
 # ==========================================
 
 def get_options_with_retry(stock, exp_date, retries=3):
     """Retries fetching option chain if it fails."""
     for i in range(retries):
         try:
-            # Sleep increasingly longer if we fail
             if i > 0: time.sleep(1 * (i+1)) 
             return stock.option_chain(exp_date)
         except Exception as e:
-            if i == retries - 1: raise e # Raise on last try
+            if i == retries - 1: raise e 
             pass
 
 def compute_recommendation(ticker_symbol, progress_callback=None):
     try:
         ticker_symbol = ticker_symbol.strip().upper()
-        
-        # 1. INITIALIZATION
-        # We do NOT use a custom session object here because yfinance 
-        # has internal logic to fetch cookies/crumbs that custom sessions often break.
         stock = yf.Ticker(ticker_symbol)
         
-        # 2. FETCH EARNINGS
+        # 1. FETCH EARNINGS
         next_earnings = "N/A"
         try:
             cal = stock.calendar
@@ -145,21 +127,17 @@ def compute_recommendation(ticker_symbol, progress_callback=None):
                 future_dates = [d for d in dates if d >= now]
                 if future_dates:
                     next_earnings = future_dates[0].strftime("%Y-%m-%d")
-        except Exception as e:
-            # Log warnings internally but don't stop
-            print(f"Earnings warning: {e}")
+        except:
             pass
 
-        # 3. FETCH OPTION DATES
+        # 2. FETCH OPTION DATES
         try:
-            # This is where "No options found" usually happens
             opts = stock.options 
             if not opts:
-                # Try one more time with a small sleep, might be a fluke
                 time.sleep(1)
                 opts = stock.options
                 if not opts:
-                    return {"error": f"YFinance returned no option dates. (Likely Rate Limit or No Data)"}
+                    return {"error": f"YFinance returned no option dates."}
         except Exception as e:
             return {"error": f"Failed to fetch option dates: {str(e)}"}
 
@@ -168,21 +146,18 @@ def compute_recommendation(ticker_symbol, progress_callback=None):
         except ValueError as ve:
             return {"error": str(ve)}
 
-        # 4. FETCH CHAINS LOOP
+        # 3. FETCH CHAINS LOOP
         options_chains = {}
         total = len(exp_dates)
         
         for idx, exp_date in enumerate(exp_dates):
-            # RATE LIMIT PROTECTION
-            # Random sleep between 0.25s and 0.5s to act human
+            # Sleep to avoid 429
             time.sleep(random.uniform(0.25, 0.50))
             
             try:
                 chain = get_options_with_retry(stock, exp_date)
                 options_chains[exp_date] = chain
             except Exception as e:
-                # Log specific error for this date
-                print(f"Failed {exp_date}: {e}")
                 continue
 
             if progress_callback:
@@ -191,18 +166,16 @@ def compute_recommendation(ticker_symbol, progress_callback=None):
         if not options_chains:
             return {"error": "All option chain downloads failed."}
 
-        # 5. FETCH PRICE HISTORY
+        # 4. FETCH PRICE HISTORY
         try:
-            # 3 months for volatility calc
             hist = stock.history(period="3mo")
             if hist.empty:
                 return {"error": "Price history is empty."}
-            
             underlying_price = hist['Close'].iloc[-1]
         except Exception as e:
             return {"error": f"Failed to fetch price history: {str(e)}"}
 
-        # 6. CALCULATIONS
+        # 5. CALCULATIONS
         atm_iv = {}
         straddle = None 
         i_count = 0
@@ -210,10 +183,8 @@ def compute_recommendation(ticker_symbol, progress_callback=None):
         for exp_date, chain in options_chains.items():
             calls = chain.calls
             puts = chain.puts
-            
             if calls.empty or puts.empty: continue
 
-            # Find ATM IV
             call_diffs = (calls['strike'] - underlying_price).abs()
             call_idx = call_diffs.idxmin()
             call_iv = calls.loc[call_idx, 'impliedVolatility']
@@ -222,13 +193,10 @@ def compute_recommendation(ticker_symbol, progress_callback=None):
             put_idx = put_diffs.idxmin()
             put_iv = puts.loc[put_idx, 'impliedVolatility']
 
-            # Average IV
             atm_iv_val = (call_iv + put_iv) / 2.0
-            # Filter bad data (sometimes Yahoo sends 0.0 for IV)
             if atm_iv_val > 0.01:
                 atm_iv[exp_date] = atm_iv_val
 
-            # Straddle Cost (Nearest Expiry)
             if i_count == 0:
                 c_mid = (calls.loc[call_idx, 'bid'] + calls.loc[call_idx, 'ask']) / 2
                 p_mid = (puts.loc[put_idx, 'bid'] + puts.loc[put_idx, 'ask']) / 2
@@ -237,9 +205,8 @@ def compute_recommendation(ticker_symbol, progress_callback=None):
             i_count += 1
         
         if not atm_iv:
-            return {"error": "Could not determine valid ATM IVs (Data might be zero)."}
+            return {"error": "Could not determine valid ATM IVs."}
         
-        # Spline Calc
         today = datetime.today().date()
         dtes = []
         ivs = []
@@ -252,7 +219,6 @@ def compute_recommendation(ticker_symbol, progress_callback=None):
             
         term_spline = build_term_structure(dtes, ivs)
         
-        # Metrics
         try:
             ts_slope = (term_spline(45) - term_spline(dtes[0])) / (45 - dtes[0])
             iv30 = term_spline(30)
@@ -261,9 +227,8 @@ def compute_recommendation(ticker_symbol, progress_callback=None):
             avg_vol = hist['Volume'].rolling(30).mean().iloc[-1]
             exp_move = (straddle / underlying_price * 100) if straddle else 0
         except Exception as e:
-            return {"error": f"Math error during calc: {str(e)}"}
+            return {"error": f"Math error: {str(e)}"}
 
-        # Recommendation Logic
         pass_vol = avg_vol >= 1500000
         pass_ratio = ratio >= 1.25
         pass_slope = ts_slope <= -0.00406
@@ -289,7 +254,6 @@ def compute_recommendation(ticker_symbol, progress_callback=None):
         }
 
     except Exception as e:
-        # This catches ANY crash and returns it as a string
         return {"error": f"CRITICAL: {str(e)}"}
 
 # ==========================================
@@ -298,11 +262,11 @@ def compute_recommendation(ticker_symbol, progress_callback=None):
 
 def main():
     st.set_page_config(page_title="Earnings Checker", layout="wide")
-    st.title("Earnings Position Checker (Debug Mode)")
+    st.title("Earnings Position Checker")
 
-    tab1, tab2 = st.tabs(["Single Ticker", "Batch / S&P 500"])
+    tab1, tab2 = st.tabs(["Single Ticker", "Batch Analysis"])
 
-    # --- TAB 1 ---
+    # --- TAB 1: SINGLE TICKER ---
     with tab1:
         with st.form("single"):
             ticker = st.text_input("Symbol", "AAPL")
@@ -310,36 +274,74 @@ def main():
         
         if submitted and ticker:
             with st.spinner(f"Scanning {ticker}..."):
-                # Progress bar for single mode
                 pbar = st.progress(0, text="Init...")
                 def update_p(x): pbar.progress(x, text="Fetching Options...")
-                
                 res = compute_recommendation(ticker, update_p)
                 pbar.empty()
             
             if "error" in res:
-                st.error(f"❌ ERROR for {ticker}:\n\n{res['error']}")
+                st.error(f"❌ ERROR for {ticker}: {res['error']}")
             else:
-                # Success UI
                 color = "#28a745" if res['Status'] == "RECOMMENDED" else "#ffc107" if res['Status'] == "CONSIDER" else "#dc3545"
                 st.markdown(f"<h2 style='color:{color}; border:1px solid {color}; padding:10px'>{res['Status']}</h2>", unsafe_allow_html=True)
                 
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Earnings", res['Next Earnings'])
-                c2.metric("Avg Vol", f"{res['Avg Vol']/1e6:.2f}M", delta="PASS" if res['pass_vol'] else "FAIL")
-                c3.metric("IV/RV Ratio", f"{res['IV30/RV30']:.2f}", delta="PASS" if res['pass_ratio'] else "FAIL")
-                c4.metric("Slope", f"{res['TS Slope']:.5f}", delta="PASS" if res['pass_slope'] else "FAIL")
+                c1.metric("Next Earnings", res['Next Earnings'])
+                c2.metric("Avg Vol (>1.5M)", f"{res['Avg Vol']/1e6:.2f}M", delta="PASS" if res['pass_vol'] else "FAIL")
+                c3.metric("Ratio (>1.25)", f"{res['IV30/RV30']:.2f}", delta="PASS" if res['pass_ratio'] else "FAIL")
+                c4.metric("Slope (<-0.004)", f"{res['TS Slope']:.5f}", delta="PASS" if res['pass_slope'] else "FAIL")
                 st.info(f"Expected Move: {res['Exp Move %']:.2f}%")
 
-    # --- TAB 2 ---
+    # --- TAB 2: BATCH ---
     with tab2:
-        col_in, col_btn = st.columns([3,1])
-        with col_in:
-            batch_txt = st.text_area("Tickers (comma sep) or leave empty for S&P500", height=100)
-        with col_btn:
-            st.write("")
-            st.write("")
+        st.markdown("### 1. Upload Tickers (Optional)")
+        uploaded_file = st.file_uploader("Upload CSV (Column header must be 'tickers')", type=['csv'])
+        
+        # --- NEW LOGIC START ---
+        # Check if a file is uploaded and if it's DIFFERENT from the last one we processed
+        if uploaded_file is not None:
+            file_id = f"{uploaded_file.name}_{uploaded_file.size}"
+            
+            if st.session_state.get('last_processed_file_id') != file_id:
+                try:
+                    df_up = pd.read_csv(uploaded_file)
+                    cols = [c.lower() for c in df_up.columns]
+                    if 'tickers' in cols:
+                        idx = cols.index('tickers')
+                        raw_tickers = df_up.iloc[:, idx].dropna().astype(str).tolist()
+                        cleaned_tickers = [t.strip().upper() for t in raw_tickers if t.strip()]
+                        combined_str = ", ".join(cleaned_tickers)
+                        
+                        # THIS IS THE FIX: Directly update the session state key for the text area
+                        st.session_state['batch_tickers_input'] = combined_str
+                        st.session_state['last_processed_file_id'] = file_id
+                        
+                        st.success(f"Loaded {len(cleaned_tickers)} tickers from CSV. They have been added to the box below.")
+                    else:
+                        st.error("CSV must have a column named 'tickers'.")
+                except Exception as e:
+                    st.error(f"Error reading CSV: {e}")
+        # --- NEW LOGIC END ---
+
+        st.markdown("### 2. Review & Run")
+        
+        # Ensure the key exists in session state before creating the widget
+        if 'batch_tickers_input' not in st.session_state:
+            st.session_state['batch_tickers_input'] = ""
+
+        # The text area is now bound to 'batch_tickers_input'. 
+        # Any update to st.session_state['batch_tickers_input'] (like from the CSV loader)
+        # will immediately appear here.
+        batch_txt = st.text_area(
+            "Enter tickers (comma separated)", 
+            height=100, 
+            key="batch_tickers_input" 
+        )
+
+        col_btn1, col_btn2 = st.columns([1,5])
+        with col_btn1:
             run_batch = st.button("Run Batch")
+        with col_btn2:
             stop_batch = st.button("STOP")
 
         if "stop" not in st.session_state: st.session_state.stop = False
@@ -347,64 +349,63 @@ def main():
 
         if run_batch:
             st.session_state.stop = False
-            if batch_txt.strip():
-                tickers = [x.strip() for x in batch_txt.split(',') if x.strip()]
+            if not batch_txt.strip():
+                st.warning("Please enter tickers or upload a CSV.")
             else:
-                with st.spinner("Fetching S&P 500..."):
-                    tickers = get_sp500_tickers()
-            
-            container = st.empty()
-            prog = st.progress(0, "Batch Starting...")
-            results = []
+                tickers = [x.strip() for x in batch_txt.split(',') if x.strip()]
+                
+                container = st.empty()
+                prog = st.progress(0, "Starting...")
+                results = []
 
-            for i, t in enumerate(tickers):
-                if st.session_state.stop:
-                    st.warning("Stopped.")
-                    break
-                
-                prog.progress((i)/len(tickers), f"Processing {t}...")
-                
-                # Call analysis
-                data = compute_recommendation(t)
-                
-                if "error" in data:
-                    # LOG THE ERROR IN THE TABLE
-                    results.append({
-                        "Ticker": t,
-                        "Status": "ERROR", 
-                        "Note": data['error'], # <--- SHOWS THE ERROR REASON
-                        "Slope": 0, "Ratio": 0, "Vol": 0
-                    })
-                else:
-                    results.append({
-                        "Ticker": t,
-                        "Status": data['Status'],
-                        "Note": data['Next Earnings'],
-                        "Slope": round(data['TS Slope'], 5),
-                        "Ratio": round(data['IV30/RV30'], 2),
-                        "Vol": round(data['Avg Vol']/1e6, 2)
-                    })
-                
-                # Show partial dataframe
-                df = pd.DataFrame(results)
-                
-                def color_row(row):
-                    s = row['Status']
-                    if s == 'RECOMMENDED': return ['background-color: #d4edda']*len(row)
-                    if s == 'ERROR': return ['background-color: #f8d7da']*len(row)
-                    if s == 'CONSIDER': return ['background-color: #fff3cd']*len(row)
-                    return ['']*len(row)
+                for i, t in enumerate(tickers):
+                    if st.session_state.stop:
+                        st.warning("Stopped by user.")
+                        break
+                    
+                    prog.progress((i)/len(tickers), f"Processing {t} ({i+1}/{len(tickers)})...")
+                    
+                    data = compute_recommendation(t)
+                    
+                    if "error" in data:
+                        results.append({
+                            "Ticker": t,
+                            "Status": "ERROR", 
+                            "Note": data['error'],
+                            "Slope (<-0.004)": 0, 
+                            "Ratio (>1.25)": 0, 
+                            "Vol (>1.5M)": 0,
+                            "ExpMove%": 0
+                        })
+                    else:
+                        results.append({
+                            "Ticker": t,
+                            "Status": data['Status'],
+                            "Note": data['Next Earnings'],
+                            "Slope (<-0.004)": round(data['TS Slope'], 5),
+                            "Ratio (>1.25)": round(data['IV30/RV30'], 2),
+                            "Vol (>1.5M)": f"{data['Avg Vol']/1e6:.2f}M",
+                            "ExpMove%": round(data['Exp Move %'], 2)
+                        })
+                    
+                    df = pd.DataFrame(results)
+                    
+                    def color_row(row):
+                        s = row['Status']
+                        if s == 'RECOMMENDED': return ['background-color: #d4edda']*len(row)
+                        if s == 'ERROR': return ['background-color: #f8d7da']*len(row)
+                        if s == 'CONSIDER': return ['background-color: #fff3cd']*len(row)
+                        return ['']*len(row)
 
-                try:
-                    container.dataframe(df.style.apply(color_row, axis=1), use_container_width=True)
-                except:
-                    container.dataframe(df, use_container_width=True)
-                
-                # Crucial sleep to prevent back-to-back 429
-                time.sleep(1.0) 
+                    try:
+                        container.dataframe(df.style.apply(color_row, axis=1), use_container_width=True)
+                    except:
+                        container.dataframe(df, use_container_width=True)
+                    
+                    time.sleep(1.0) 
 
-            prog.empty()
-            st.success("Done.")
+                prog.empty()
+                st.success("Batch Complete.")
 
 if __name__ == "__main__":
     main()
