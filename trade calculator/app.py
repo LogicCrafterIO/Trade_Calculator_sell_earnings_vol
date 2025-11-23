@@ -113,7 +113,10 @@ def get_options_with_retry(stock, exp_date, retries=3):
             pass
 
 def get_atm_details(chain, underlying_price):
-    """Helper to extract ATM Call/Put Price (Mid) and IV from a chain."""
+    """
+    Helper to extract ATM details.
+    Returns Bid, Ask, and IV separately.
+    """
     try:
         calls = chain.calls
         puts = chain.puts
@@ -121,23 +124,30 @@ def get_atm_details(chain, underlying_price):
         if calls.empty or puts.empty:
             return None
 
-        # Find ATM Call
+        # --- CALLS ---
         c_diffs = (calls['strike'] - underlying_price).abs()
         c_idx = c_diffs.idxmin()
-        c_iv = calls.loc[c_idx, 'impliedVolatility']
-        c_mid = (calls.loc[c_idx, 'bid'] + calls.loc[c_idx, 'ask']) / 2.0
-
-        # Find ATM Put
+        
+        # --- PUTS ---
         p_diffs = (puts['strike'] - underlying_price).abs()
         p_idx = p_diffs.idxmin()
-        p_iv = puts.loc[p_idx, 'impliedVolatility']
-        p_mid = (puts.loc[p_idx, 'bid'] + puts.loc[p_idx, 'ask']) / 2.0
+
+        # Extract precise data
+        def get_val(df, idx, col):
+            return df.loc[idx, col] if col in df.columns else 0.0
 
         return {
-            'c_price': c_mid, 'c_iv': c_iv,
-            'p_price': p_mid, 'p_iv': p_iv
+            # Call Data
+            'c_bid': get_val(calls, c_idx, 'bid'),
+            'c_ask': get_val(calls, c_idx, 'ask'),
+            'c_iv': get_val(calls, c_idx, 'impliedVolatility'),
+            
+            # Put Data
+            'p_bid': get_val(puts, p_idx, 'bid'),
+            'p_ask': get_val(puts, p_idx, 'ask'),
+            'p_iv': get_val(puts, p_idx, 'impliedVolatility')
         }
-    except:
+    except Exception as e:
         return None
 
 def compute_recommendation(ticker_symbol, progress_callback=None):
@@ -270,7 +280,7 @@ def compute_recommendation(ticker_symbol, progress_callback=None):
             status = "AVOID"
 
         # ==========================================
-        # CALENDAR SPREAD DATA EXTRACTION
+        # LONG CALENDAR SPREAD DATA EXTRACTION
         # ==========================================
         cal_data = {
             "Near Call Px": 0, "Near Call IV": 0,
@@ -284,15 +294,11 @@ def compute_recommendation(ticker_symbol, progress_callback=None):
         if status in ["RECOMMENDED", "CONSIDER"]:
             try:
                 # 1. Identify Dates
-                # Nearest is index 0
                 near_date = exp_dates[0]
                 
                 # 30 Day is date closest to Today + 30
                 target_date = today + timedelta(days=30)
-                # exp_dates are strings, convert to date objs to compare
                 date_objs = [datetime.strptime(d, "%Y-%m-%d").date() for d in exp_dates]
-                
-                # Find index of closest date
                 closest_idx = min(range(len(date_objs)), key=lambda i: abs((date_objs[i] - target_date).days))
                 far_date = exp_dates[closest_idx]
 
@@ -301,20 +307,27 @@ def compute_recommendation(ticker_symbol, progress_callback=None):
                 far_details = get_atm_details(options_chains[far_date], underlying_price)
 
                 if near_details and far_details:
-                    # Call Side
-                    cal_data["Near Call Px"] = near_details['c_price']
+                    # Logic per user request (Long Calendar):
+                    # Sell Near (Bid) vs Buy 30d (Ask)
+                    
+                    # CALLS
+                    cal_data["Near Call Px"] = near_details['c_bid'] # Sell
                     cal_data["Near Call IV"] = near_details['c_iv']
-                    cal_data["30d Call Px"] = far_details['c_price']
+                    cal_data["30d Call Px"] = far_details['c_ask'] # Buy
                     cal_data["30d Call IV"] = far_details['c_iv']
-                    # Calendar Debit = Long (Far) - Short (Near)
-                    cal_data["Call Spread Debit"] = far_details['c_price'] - near_details['c_price']
+                    
+                    # Debit = Paid(Far Ask) - Received(Near Bid)
+                    cal_data["Call Spread Debit"] = cal_data["30d Call Px"] - cal_data["Near Call Px"]
 
-                    # Put Side
-                    cal_data["Near Put Px"] = near_details['p_price']
+                    # PUTS
+                    cal_data["Near Put Px"] = near_details['p_bid'] # Sell
                     cal_data["Near Put IV"] = near_details['p_iv']
-                    cal_data["30d Put Px"] = far_details['p_price']
+                    cal_data["30d Put Px"] = far_details['p_ask'] # Buy
                     cal_data["30d Put IV"] = far_details['p_iv']
-                    cal_data["Put Spread Debit"] = far_details['p_price'] - near_details['p_price']
+                    
+                    # Debit = Paid(Far Ask) - Received(Near Bid)
+                    cal_data["Put Spread Debit"] = cal_data["30d Put Px"] - cal_data["Near Put Px"]
+                    
             except Exception as e:
                 print(f"Error extracting calendar data: {e}")
 
@@ -383,21 +396,21 @@ def main():
                 # SHOW CALENDAR DATA IF RELEVANT
                 if res['Status'] in ["RECOMMENDED", "CONSIDER"]:
                     st.divider()
-                    st.subheader("Long Calendar Spread Analysis (ATM)")
+                    st.subheader("Long Calendar Spread (Sell Near, Buy 30d)")
                     
                     col_call, col_put = st.columns(2)
                     
                     with col_call:
                         st.markdown("### 📞 CALL SIDE")
-                        st.write(f"**Near Call:** ${res['Near Call Px']:.2f} (IV: {res['Near Call IV']:.2%})")
-                        st.write(f"**30d Call:** ${res['30d Call Px']:.2f} (IV: {res['30d Call IV']:.2%})")
-                        st.metric("Net Debit (Call)", f"${res['Call Spread Debit']:.2f}")
+                        st.write(f"**Sell Near (Bid):** ${res['Near Call Px']:.2f} (IV: {res['Near Call IV']:.2%})")
+                        st.write(f"**Buy 30d (Ask):** ${res['30d Call Px']:.2f} (IV: {res['30d Call IV']:.2%})")
+                        st.metric("Net Debit (Buy - Sell)", f"${res['Call Spread Debit']:.2f}")
 
                     with col_put:
                         st.markdown("### 📉 PUT SIDE")
-                        st.write(f"**Near Put:** ${res['Near Put Px']:.2f} (IV: {res['Near Put IV']:.2%})")
-                        st.write(f"**30d Put:** ${res['30d Put Px']:.2f} (IV: {res['30d Put IV']:.2%})")
-                        st.metric("Net Debit (Put)", f"${res['Put Spread Debit']:.2f}")
+                        st.write(f"**Sell Near (Bid):** ${res['Near Put Px']:.2f} (IV: {res['Near Put IV']:.2%})")
+                        st.write(f"**Buy 30d (Ask):** ${res['30d Put Px']:.2f} (IV: {res['30d Put IV']:.2%})")
+                        st.metric("Net Debit (Buy - Sell)", f"${res['Put Spread Debit']:.2f}")
 
     # --- TAB 2: BATCH ---
     with tab2:
@@ -492,19 +505,19 @@ def main():
                         # Add Calendar Data if Status is good
                         if data['Status'] in ["RECOMMENDED", "CONSIDER"]:
                             row["Call Debit"] = round(data["Call Spread Debit"], 2)
-                            row["Put Debit"] = round(data["Put Spread Debit"], 2)
+                            row["Near Call Bid"] = round(data["Near Call Px"], 2)
                             row["Near Call IV"] = round(data["Near Call IV"], 3)
+                            row["30d Call Ask"] = round(data["30d Call Px"], 2)
                             row["30d Call IV"] = round(data["30d Call IV"], 3)
+                            row["Put Debit"] = round(data["Put Spread Debit"], 2)
+                            row["Near Put Bid"] = round(data["Near Put Px"], 2)
                             row["Near Put IV"] = round(data["Near Put IV"], 3)
+                            row["30d Put Ask"] = round(data["30d Put Px"], 2)
                             row["30d Put IV"] = round(data["30d Put IV"], 3)
                             
-                            # Add prices if you want table to be super wide, 
-                            # but let's keep it readable with just debits and IVs
-                            # If you really want all 10 cols, uncomment below:
-                            row["Near Call $"] = round(data["Near Call Px"], 2)
-                            row["30d Call $"] = round(data["30d Call Px"], 2)
-                            row["Near Put $"] = round(data["Near Put Px"], 2)
-                            row["30d Put $"] = round(data["30d Put Px"], 2)
+                            # Prices included but commented out for cleaner table width
+                            # row["Near Call (Bid)"] = round(data["Near Call Px"], 2)
+                            # row["30d Call (Ask)"] = round(data["30d Call Px"], 2)
 
                     results.append(row)
                     
