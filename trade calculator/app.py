@@ -112,6 +112,34 @@ def get_options_with_retry(stock, exp_date, retries=3):
             if i == retries - 1: raise e 
             pass
 
+def get_atm_details(chain, underlying_price):
+    """Helper to extract ATM Call/Put Price (Mid) and IV from a chain."""
+    try:
+        calls = chain.calls
+        puts = chain.puts
+        
+        if calls.empty or puts.empty:
+            return None
+
+        # Find ATM Call
+        c_diffs = (calls['strike'] - underlying_price).abs()
+        c_idx = c_diffs.idxmin()
+        c_iv = calls.loc[c_idx, 'impliedVolatility']
+        c_mid = (calls.loc[c_idx, 'bid'] + calls.loc[c_idx, 'ask']) / 2.0
+
+        # Find ATM Put
+        p_diffs = (puts['strike'] - underlying_price).abs()
+        p_idx = p_diffs.idxmin()
+        p_iv = puts.loc[p_idx, 'impliedVolatility']
+        p_mid = (puts.loc[p_idx, 'bid'] + puts.loc[p_idx, 'ask']) / 2.0
+
+        return {
+            'c_price': c_mid, 'c_iv': c_iv,
+            'p_price': p_mid, 'p_iv': p_iv
+        }
+    except:
+        return None
+
 def compute_recommendation(ticker_symbol, progress_callback=None):
     try:
         ticker_symbol = ticker_symbol.strip().upper()
@@ -197,6 +225,7 @@ def compute_recommendation(ticker_symbol, progress_callback=None):
             if atm_iv_val > 0.01:
                 atm_iv[exp_date] = atm_iv_val
 
+            # Standard Straddle Calc (Nearest)
             if i_count == 0:
                 c_mid = (calls.loc[call_idx, 'bid'] + calls.loc[call_idx, 'ask']) / 2
                 p_mid = (puts.loc[put_idx, 'bid'] + puts.loc[put_idx, 'ask']) / 2
@@ -240,6 +269,55 @@ def compute_recommendation(ticker_symbol, progress_callback=None):
         else:
             status = "AVOID"
 
+        # ==========================================
+        # CALENDAR SPREAD DATA EXTRACTION
+        # ==========================================
+        cal_data = {
+            "Near Call Px": 0, "Near Call IV": 0,
+            "30d Call Px": 0, "30d Call IV": 0,
+            "Call Spread Debit": 0,
+            "Near Put Px": 0, "Near Put IV": 0,
+            "30d Put Px": 0, "30d Put IV": 0,
+            "Put Spread Debit": 0
+        }
+
+        if status in ["RECOMMENDED", "CONSIDER"]:
+            try:
+                # 1. Identify Dates
+                # Nearest is index 0
+                near_date = exp_dates[0]
+                
+                # 30 Day is date closest to Today + 30
+                target_date = today + timedelta(days=30)
+                # exp_dates are strings, convert to date objs to compare
+                date_objs = [datetime.strptime(d, "%Y-%m-%d").date() for d in exp_dates]
+                
+                # Find index of closest date
+                closest_idx = min(range(len(date_objs)), key=lambda i: abs((date_objs[i] - target_date).days))
+                far_date = exp_dates[closest_idx]
+
+                # 2. Extract Data
+                near_details = get_atm_details(options_chains[near_date], underlying_price)
+                far_details = get_atm_details(options_chains[far_date], underlying_price)
+
+                if near_details and far_details:
+                    # Call Side
+                    cal_data["Near Call Px"] = near_details['c_price']
+                    cal_data["Near Call IV"] = near_details['c_iv']
+                    cal_data["30d Call Px"] = far_details['c_price']
+                    cal_data["30d Call IV"] = far_details['c_iv']
+                    # Calendar Debit = Long (Far) - Short (Near)
+                    cal_data["Call Spread Debit"] = far_details['c_price'] - near_details['c_price']
+
+                    # Put Side
+                    cal_data["Near Put Px"] = near_details['p_price']
+                    cal_data["Near Put IV"] = near_details['p_iv']
+                    cal_data["30d Put Px"] = far_details['p_price']
+                    cal_data["30d Put IV"] = far_details['p_iv']
+                    cal_data["Put Spread Debit"] = far_details['p_price'] - near_details['p_price']
+            except Exception as e:
+                print(f"Error extracting calendar data: {e}")
+
         return {
             "Symbol": ticker_symbol,
             "Status": status,
@@ -250,7 +328,8 @@ def compute_recommendation(ticker_symbol, progress_callback=None):
             "Exp Move %": exp_move,
             "pass_vol": pass_vol,
             "pass_ratio": pass_ratio,
-            "pass_slope": pass_slope
+            "pass_slope": pass_slope,
+            **cal_data # Merge calendar data
         }
 
     except Exception as e:
@@ -291,6 +370,7 @@ def main():
                 else:
                     bg_color = "#f8d7da"
                     text_color = "#721c24"
+                
                 st.markdown(f"<h2 style='background-color:{bg_color}; color:{text_color}; border:2px solid {text_color}; padding:12px; border-radius:6px; text-align:center; font-weight:bold'>{res['Status']}</h2>", unsafe_allow_html=True)
                 
                 c1, c2, c3, c4 = st.columns(4)
@@ -300,13 +380,30 @@ def main():
                 c4.metric("Slope (<-0.004)", f"{res['TS Slope']:.5f}", delta="PASS" if res['pass_slope'] else "FAIL")
                 st.info(f"Expected Move: {res['Exp Move %']:.2f}%")
 
+                # SHOW CALENDAR DATA IF RELEVANT
+                if res['Status'] in ["RECOMMENDED", "CONSIDER"]:
+                    st.divider()
+                    st.subheader("Long Calendar Spread Analysis (ATM)")
+                    
+                    col_call, col_put = st.columns(2)
+                    
+                    with col_call:
+                        st.markdown("### 📞 CALL SIDE")
+                        st.write(f"**Near Call:** ${res['Near Call Px']:.2f} (IV: {res['Near Call IV']:.2%})")
+                        st.write(f"**30d Call:** ${res['30d Call Px']:.2f} (IV: {res['30d Call IV']:.2%})")
+                        st.metric("Net Debit (Call)", f"${res['Call Spread Debit']:.2f}")
+
+                    with col_put:
+                        st.markdown("### 📉 PUT SIDE")
+                        st.write(f"**Near Put:** ${res['Near Put Px']:.2f} (IV: {res['Near Put IV']:.2%})")
+                        st.write(f"**30d Put:** ${res['30d Put Px']:.2f} (IV: {res['30d Put IV']:.2%})")
+                        st.metric("Net Debit (Put)", f"${res['Put Spread Debit']:.2f}")
+
     # --- TAB 2: BATCH ---
     with tab2:
         st.markdown("### 1. Upload Tickers (Optional)")
         uploaded_file = st.file_uploader("Upload CSV (Column header must be 'tickers')", type=['csv'])
         
-        # --- NEW LOGIC START ---
-        # Check if a file is uploaded and if it's DIFFERENT from the last one we processed
         if uploaded_file is not None:
             file_id = f"{uploaded_file.name}_{uploaded_file.size}"
             
@@ -320,26 +417,20 @@ def main():
                         cleaned_tickers = [t.strip().upper() for t in raw_tickers if t.strip()]
                         combined_str = ", ".join(cleaned_tickers)
                         
-                        # THIS IS THE FIX: Directly update the session state key for the text area
                         st.session_state['batch_tickers_input'] = combined_str
                         st.session_state['last_processed_file_id'] = file_id
                         
-                        st.success(f"Loaded {len(cleaned_tickers)} tickers from CSV. They have been added to the box below.")
+                        st.success(f"Loaded {len(cleaned_tickers)} tickers from CSV.")
                     else:
                         st.error("CSV must have a column named 'tickers'.")
                 except Exception as e:
                     st.error(f"Error reading CSV: {e}")
-        # --- NEW LOGIC END ---
 
         st.markdown("### 2. Review & Run")
         
-        # Ensure the key exists in session state before creating the widget
         if 'batch_tickers_input' not in st.session_state:
             st.session_state['batch_tickers_input'] = ""
 
-        # The text area is now bound to 'batch_tickers_input'. 
-        # Any update to st.session_state['batch_tickers_input'] (like from the CSV loader)
-        # will immediately appear here.
         batch_txt = st.text_area(
             "Enter tickers (comma separated)", 
             height=100, 
@@ -375,31 +466,53 @@ def main():
                     
                     data = compute_recommendation(t)
                     
+                    row = {}
                     if "error" in data:
-                        results.append({
+                        row = {
                             "Ticker": t,
                             "Status": "ERROR", 
                             "Note": data['error'],
-                            "Slope (<-0.004)": 0, 
-                            "Ratio (>1.25)": 0, 
-                            "Vol (>1.5M)": 0,
-                            "ExpMove%": 0
-                        })
+                            # Fill empty for structure
+                            "Slope": 0, "Ratio": 0, "Vol": 0, "ExpMove%": 0,
+                            "Call Debit": 0, "Put Debit": 0,
+                            "Near Call IV": 0, "30d Call IV": 0,
+                            "Near Put IV": 0, "30d Put IV": 0
+                        }
                     else:
-                        results.append({
+                        row = {
                             "Ticker": t,
                             "Status": data['Status'],
                             "Note": data['Next Earnings'],
-                            "Slope (<-0.004)": round(data['TS Slope'], 5),
-                            "Ratio (>1.25)": round(data['IV30/RV30'], 2),
-                            "Vol (>1.5M)": f"{data['Avg Vol']/1e6:.2f}M",
+                            "Slope": round(data['TS Slope'], 5),
+                            "Ratio": round(data['IV30/RV30'], 2),
+                            "Vol": f"{data['Avg Vol']/1e6:.2f}M",
                             "ExpMove%": round(data['Exp Move %'], 2)
-                        })
+                        }
+                        
+                        # Add Calendar Data if Status is good
+                        if data['Status'] in ["RECOMMENDED", "CONSIDER"]:
+                            row["Call Debit"] = round(data["Call Spread Debit"], 2)
+                            row["Put Debit"] = round(data["Put Spread Debit"], 2)
+                            row["Near Call IV"] = round(data["Near Call IV"], 3)
+                            row["30d Call IV"] = round(data["30d Call IV"], 3)
+                            row["Near Put IV"] = round(data["Near Put IV"], 3)
+                            row["30d Put IV"] = round(data["30d Put IV"], 3)
+                            
+                            # Add prices if you want table to be super wide, 
+                            # but let's keep it readable with just debits and IVs
+                            # If you really want all 10 cols, uncomment below:
+                            row["Near Call $"] = round(data["Near Call Px"], 2)
+                            row["30d Call $"] = round(data["30d Call Px"], 2)
+                            row["Near Put $"] = round(data["Near Put Px"], 2)
+                            row["30d Put $"] = round(data["30d Put Px"], 2)
+
+                    results.append(row)
                     
                     df = pd.DataFrame(results)
                     
                     def color_row(row):
                         s = row['Status']
+                        style = []
                         if s == 'RECOMMENDED': 
                             return ['background-color: #d4edda; color: #155724; font-weight: bold']*len(row)
                         if s == 'ERROR': 
